@@ -3,7 +3,7 @@
   "displayName": "DockerManager-Simple",
   "publisher": "HeHao",
   "description": "关于Docker的一个简易的管理器",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "repository": {
     "type": "git",
     "url": "https://github.com/xiaohe2018/dockermanager-simple.git"

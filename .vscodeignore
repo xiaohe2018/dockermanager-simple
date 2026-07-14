@@ -6,5 +6,5 @@ tsconfig.json
 package-lock.json
 DOCKER_REMOTE_SETUP.md
 esbuild.config.js
-node_modules/.cache/**
+node_modules/**
 .github/**
