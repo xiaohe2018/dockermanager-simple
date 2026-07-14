@@ -1,0 +1,49 @@
+name: Release VSIX
+
+on:
+  push:
+    tags:
+      - 'v*'   # 推送 v0.0.8 这样的 tag 时触发
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Package VSIX
+        run: npx @vscode/vsce package
+
+      - name: Get version
+        id: version
+        run: echo "VSIX=$(ls *.vsix)" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            ## 🚀 ${{ github.ref_name }}
+
+            详见 [CHANGELOG](./CHANGELOG.md)
+
+            ### 安装
+
+            下载下方 `.vsix` 文件，在 VS Code 中：`扩展` → `...` → `从 VSIX 安装`
+          files: |
+            *.vsix
+          draft: false
+          prerelease: false
