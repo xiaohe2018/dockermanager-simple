@@ -22,7 +22,7 @@ jobs:
 
       - name: Install & Package
         run: |
-          npm ci
+          npm install --no-audit --no-fund
           npx vsce package
 
       - name: Create Release
