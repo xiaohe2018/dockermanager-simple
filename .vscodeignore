@@ -1,0 +1,9 @@
+.vscode/**
+.gitignore
+src/**
+tsconfig.json
+*.vsix
+package-lock.json
+DOCKER_REMOTE_SETUP.md
+node_modules/**
+esbuild.config.js
