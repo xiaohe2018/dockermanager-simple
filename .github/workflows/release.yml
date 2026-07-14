@@ -3,7 +3,7 @@ name: Release VSIX
 on:
   push:
     tags:
-      - 'v*'   # 推送 v0.0.8 这样的 tag 时触发
+      - 'v*'
 
 jobs:
   build-and-release:
@@ -18,18 +18,14 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       - name: Package VSIX
         run: npx @vscode/vsce package
-
-      - name: Get version
-        id: version
-        run: echo "VSIX=$(ls *.vsix)" >> $GITHUB_OUTPUT
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -37,8 +33,6 @@ jobs:
           name: ${{ github.ref_name }}
           body: |
             ## 🚀 ${{ github.ref_name }}
-
-            详见 [CHANGELOG](./CHANGELOG.md)
 
             ### 安装
 
