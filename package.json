@@ -3,7 +3,7 @@
   "displayName": "DockerManager-Simple",
   "publisher": "HeHao",
   "description": "关于Docker的一个简易的管理器",
-  "version": "0.0.9",
+  "version": "1.0.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/xiaohe2018/dockermanager-simple.git"
@@ -39,12 +39,21 @@
               },
               "host": {
                 "type": "string",
-                "description": "Docker 主机地址 (IP 或域名)"
+                "description": "主机地址（SSH 连接用）"
               },
-              "port": {
+              "protocol": {
+                "type": "string",
+                "enum": ["ssh"],
+                "description": "连接协议（SSH）"
+              },
+              "username": {
+                "type": "string",
+                "description": "SSH 用户名"
+              },
+              "sshPort": {
                 "type": "number",
-                "default": 2375,
-                "description": "Docker API 端口"
+                "default": 22,
+                "description": "SSH 端口"
               },
               "socketPath": {
                 "type": "string",

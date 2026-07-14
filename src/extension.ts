@@ -9,8 +9,8 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // ---- 自动检测本地 Docker ----
   const localDocker = createLocalDocker();
-  const localAvailable = await testDockerConnection(localDocker);
-  if (localAvailable) {
+  const localResult = await testDockerConnection(localDocker);
+  if (localResult.ok) {
     provider.addServer({ name: 'localhost' }, true);
   }
 
@@ -127,12 +127,12 @@ function createLocalDocker(): Docker {
   });
 }
 
-async function testDockerConnection(docker: Docker): Promise<boolean> {
+async function testDockerConnection(docker: Docker): Promise<{ ok: boolean; error?: string }> {
   try {
     await docker.ping();
-    return true;
-  } catch {
-    return false;
+    return { ok: true };
+  } catch (err: any) {
+    return { ok: false, error: err.message || String(err) };
   }
 }
 
@@ -156,76 +156,262 @@ function loadRemoteServers(): void {
   }
 }
 
+// ---- SSH Config 解析 ----
+
+interface SshConfigEntry {
+  hostname?: string;
+  user?: string;
+  port?: number;
+  identityFile?: string;
+}
+
+/** 解析 ~/.ssh/config，根据 Host 别名查 HostName/User/IdentityFile */
+async function resolveSshConfig(hostAlias: string): Promise<SshConfigEntry> {
+  const os = require('os');
+  const fs = require('fs');
+  const path = require('path');
+
+  const configPath = path.join(os.homedir(), '.ssh', 'config');
+  if (!fs.existsSync(configPath)) {
+    return {};
+  }
+
+  const content = fs.readFileSync(configPath, 'utf8');
+  const lines = content.split('\n');
+
+  let currentHost: string | null = null;
+  const hosts = new Map<string, SshConfigEntry>();
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) { continue; }
+
+    const parts = line.split(/\s+/);
+    const keyword = parts[0].toLowerCase();
+    const value = parts.slice(1).join(' ');
+
+    if (keyword === 'host') {
+      // 支持 Host 后面多个别名（空格分隔）
+      for (const h of value.split(/\s+/)) {
+        if (h) { currentHost = h; }
+      }
+      if (currentHost && !hosts.has(currentHost)) {
+        hosts.set(currentHost, {});
+      }
+    } else if (currentHost) {
+      const entry = hosts.get(currentHost)!;
+      switch (keyword) {
+        case 'hostname':
+          entry.hostname = value;
+          break;
+        case 'user':
+          entry.user = value;
+          break;
+        case 'port':
+          entry.port = parseInt(value, 10);
+          break;
+        case 'identityfile':
+          // 去掉引号，处理 ~ 路径
+          entry.identityFile = value.replace(/"/g, '').replace(/^~/, os.homedir());
+          break;
+      }
+    }
+  }
+
+  // 找出所有匹配的 Host（精确 + 通配符），按文件顺序合并
+  const merged: SshConfigEntry = {};
+  for (const [pattern, entry] of hosts) {
+    if (pattern.includes('*') || pattern.includes('?')) {
+      const regex = new RegExp('^' + pattern.replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i');
+      if (regex.test(hostAlias)) {
+        Object.assign(merged, entry);
+      }
+    } else if (pattern === hostAlias) {
+      Object.assign(merged, entry);
+    }
+  }
+
+  // 如果合并后没有 IdentityFile，扫描密钥
+  if (!merged.identityFile) {
+    merged.identityFile = await pickSshKey();
+  }
+  return merged;
+}
+
+/** 扫描 ~/.ssh/ 目录，返回所有私钥路径 */
+function findAllSshKeys(): string[] {
+  const os = require('os');
+  const fs = require('fs');
+  const path = require('path');
+  const sshDir = path.join(os.homedir(), '.ssh');
+  if (!fs.existsSync(sshDir)) { return []; }
+  const skip = ['config', 'known_hosts', 'known_hosts.old', 'authorized_keys'];
+  const keys: string[] = [];
+  for (const f of fs.readdirSync(sshDir)) {
+    if (skip.includes(f) || f.endsWith('.pub')) { continue; }
+    const fp = path.join(sshDir, f);
+    try {
+      const s = fs.statSync(fp);
+      if (s.isFile() && s.size < 10000 && fs.readFileSync(fp, 'utf8').includes('PRIVATE KEY')) {
+        keys.push(fp);
+      }
+    } catch { /* skip */ }
+  }
+  return keys;
+}
+
+/** 从多个密钥中让用户选择一个，只有一个时直接返回 */
+async function pickSshKey(): Promise<string | undefined> {
+  const keys = findAllSshKeys();
+  if (keys.length === 0) { return undefined; }
+  if (keys.length === 1) { return keys[0]; }
+  const picked = await vscode.window.showQuickPick(
+    keys.map(k => ({ label: k.replace(/.*[\\/]/, ''), description: k, value: k })),
+    { placeHolder: '选择 SSH 私钥' }
+  );
+  return picked?.value;
+}
+
 async function addServerInteractive(): Promise<void> {
-  // 第一步：输入地址
-  const address = await vscode.window.showInputBox({
-    prompt: '请输入 Docker 服务器地址',
-    placeHolder: '例如: 10.0.0.102:2375 或 /var/run/docker.sock',
-    validateInput: (value) => {
-      if (!value.trim()) {
-        return '地址不能为空';
+  // 第一步：选择连接方式
+  const protocol = await vscode.window.showQuickPick(
+    [
+      { label: '$(key) SSH 连接', description: '通过 SSH 隧道访问远程 Docker（无需开放端口，更安全）', value: 'ssh' },
+      { label: '$(folder) Unix Socket', description: '本地或远程 socket 路径', value: 'socket' }
+    ],
+    { placeHolder: '选择 Docker 连接方式' }
+  );
+  if (!protocol) { return; }
+  const protoValue = protocol.value;
+
+  let config: ServerConfig = { name: '' };
+
+  if (protoValue === 'ssh') {
+    // 1. 输入 host
+    const hostInput = await vscode.window.showInputBox({
+      prompt: 'SSH 主机地址或别名（自动读取 ~/.ssh/config）',
+      placeHolder: '例如: 10.0.0.102',
+      validateInput: v => v.trim() ? null : '地址不能为空'
+    });
+    if (!hostInput) { return; }
+
+    // 2. 解析 SSH config
+    const sshInfo = await resolveSshConfig(hostInput.trim());
+    const resolvedHost = sshInfo.hostname || hostInput.trim();
+
+    // 3. 输入 username
+    const user = await vscode.window.showInputBox({
+      prompt: 'SSH 用户名',
+      value: sshInfo.user || 'root',
+      validateInput: v => v.trim() ? null : '用户名不能为空'
+    });
+    if (!user) { return; }
+
+    const baseConfig = {
+      host: resolvedHost,
+      protocol: 'ssh' as const,
+      username: user.trim(),
+      sshPort: sshInfo.port || 22,
+    };
+
+    // 4. 尝试密钥登录
+    let connectResult = await trySshConnect(baseConfig, sshInfo.identityFile);
+    if (connectResult.ok) {
+      const name = await vscode.window.showInputBox({
+        prompt: '✅ 连接成功！请输入服务器显示名称',
+        value: hostInput.trim(),
+        placeHolder: '例如: 生产服务器'
+      });
+      if (!name) { return; }
+      config = { name, ...baseConfig, privateKey: sshInfo.identityFile };
+    } else {
+      // 5. 密钥失败 → 密码登录
+      vscode.window.showInformationMessage(`密钥登录失败: ${connectResult.error}`);
+      const password = await vscode.window.showInputBox({
+        prompt: `请输入 SSH 密码（${user.trim()}@${resolvedHost}）`,
+        password: true,
+        validateInput: v => v ? null : '密码不能为空'
+      });
+      if (!password) { return; }
+
+      connectResult = await trySshConnect(baseConfig, undefined, password);
+      if (connectResult.ok) {
+        const name = await vscode.window.showInputBox({
+          prompt: '✅ 连接成功！请输入服务器显示名称',
+          value: hostInput.trim(),
+          placeHolder: '例如: 生产服务器'
+        });
+        if (!name) { return; }
+        config = { name, ...baseConfig, password };
+      } else {
+        vscode.window.showErrorMessage(`密码登录也失败: ${connectResult.error}`);
+        return;
       }
-      return null;
     }
-  });
-  if (!address) { return; }
+  } else {
+    // Socket 方式
+    const path = await vscode.window.showInputBox({
+      prompt: 'Socket 路径',
+      placeHolder: '例如: /var/run/docker.sock',
+      validateInput: v => v.trim() ? null : '路径不能为空'
+    });
+    if (!path) { return; }
 
-  // 第二步：输入名称（自动建议一个友好名称）
-  let defaultName = address.trim();
-  if (!defaultName.startsWith('/') && !defaultName.startsWith('\\')) {
-    // TCP 地址：取主机名部分作为默认名
-    const hostPart = defaultName.split(':')[0];
-    defaultName = hostPart;
-  }
-  const name = await vscode.window.showInputBox({
-    prompt: '请输入服务器显示名称',
-    placeHolder: '例如: 生产服务器',
-    value: defaultName,
-    validateInput: (value) => {
-      if (!value.trim()) {
-        return '名称不能为空';
-      }
-      return null;
+    const name = await vscode.window.showInputBox({
+      prompt: '服务器显示名称',
+      value: path.trim(),
+      placeHolder: '例如: 本地 Docker'
+    });
+    if (!name) { return; }
+
+    config = { name, socketPath: path.trim() };
+
+    // Socket 连接测试
+    const docker = createDockerFromConfig(config);
+    const connResult = await testDockerConnection(docker);
+    if (!connResult.ok) {
+      const result = await vscode.window.showWarningMessage(
+        `无法连接: ${connResult.error}，是否仍然添加？`,
+        '仍然添加', '取消'
+      );
+      if (result !== '仍然添加') { return; }
+    } else {
+      vscode.window.showInformationMessage(`已成功连接到 ${name}`);
     }
-  });
-  if (!name) { return; }
-
-  // 解析地址
-  let config: ServerConfig;
-  const trimmed = address.trim();
-
-  if (trimmed.startsWith('/') || trimmed.startsWith('\\\\.\\') || trimmed.startsWith('//./')) {
-    config = { name, socketPath: trimmed };
-  } else {
-    const parts = trimmed.split(':');
-    const host = parts[0];
-    const port = parts.length > 1 ? parseInt(parts[1], 10) : 2375;
-    config = { name, host, port };
   }
 
-  // 测试连接
-  const docker = config.socketPath
-    ? new Docker({ socketPath: config.socketPath })
-    : new Docker({ host: config.host!, port: config.port! });
-
-  const connectingMsg = vscode.window.setStatusBarMessage(`$(sync~spin) 正在连接 ${name}...`);
-  const reachable = await testDockerConnection(docker);
-  connectingMsg.dispose();
-
-  if (!reachable) {
-    const result = await vscode.window.showWarningMessage(
-      `无法连接到 ${name}，是否仍然添加？`,
-      '仍然添加',
-      '取消'
-    );
-    if (result !== '仍然添加') { return; }
-  } else {
-    vscode.window.showInformationMessage(`已成功连接到 ${name}`);
-  }
-
-  // 添加到运行时和配置文件
   provider.addServer(config, false);
   saveServerToConfig(config);
+}
+
+/** 尝试 SSH 连接，返回结果 */
+async function trySshConnect(
+  base: { host: string; username: string; sshPort: number },
+  keyPath?: string,
+  password?: string
+): Promise<{ ok: boolean; error?: string }> {
+  const sshOpts: any = {
+    protocol: 'ssh',
+    host: base.host,
+    port: base.sshPort,
+    username: base.username,
+  };
+  if (keyPath) {
+    sshOpts.sshOptions = { privateKey: require('fs').readFileSync(keyPath) };
+  } else if (password) {
+    sshOpts.sshOptions = { password };
+  }
+  const docker = new Docker(sshOpts);
+  try {
+    await docker.ping();
+    return { ok: true };
+  } catch (err: any) {
+    return { ok: false, error: err.message || String(err) };
+  }
+}
+
+function createDockerFromConfig(config: ServerConfig): Docker {
+  return new Docker({ socketPath: config.socketPath! });
 }
 
 async function removeServer(serverId: string): Promise<void> {
@@ -235,8 +421,8 @@ async function removeServer(serverId: string): Promise<void> {
   const conn = provider.getConnection(serverId);
   const updated = servers.filter(s => {
     if (!conn) { return true; }
-    if (s.host || s.port) {
-      const sid = `remote_${s.host || s.socketPath}_${s.port || ''}`;
+    if (s.host || s.socketPath) {
+      const sid = `remote_${s.host || s.socketPath}_${s.sshPort || ''}`;
       return sid !== serverId;
     }
     return true;
@@ -248,8 +434,10 @@ async function removeServer(serverId: string): Promise<void> {
 }
 
 async function saveServerToConfig(config: ServerConfig): Promise<void> {
+  // 密码和从 SSH config 解析出的密钥不持久化，每次连接时实时读取
+  const { password, privateKey, ...safe } = config;
   const wsConfig = vscode.workspace.getConfiguration('dockerManagerSimple');
   const servers: ServerConfig[] = wsConfig.get<ServerConfig[]>('servers') || [];
-  servers.push(config);
+  servers.push(safe);
   await wsConfig.update('servers', servers, vscode.ConfigurationTarget.Global);
 }

@@ -6,8 +6,13 @@ import Docker from 'dockerode';
 export interface ServerConfig {
   name: string;
   host?: string;
-  port?: number;
   socketPath?: string;
+  protocol?: 'ssh';
+  username?: string;
+  sshPort?: number;
+  privateKey?: string;
+  /** SSH 密码（与 privateKey 二选一，密码不会持久化到配置文件） */
+  password?: string;
 }
 
 interface DockerInfo {
@@ -39,14 +44,30 @@ class DockerServerConnection {
   private _connected = false;
 
   constructor(config: ServerConfig, isLocal: boolean) {
-    this.serverId = isLocal ? '__local__' : `remote_${config.host || config.socketPath}_${config.port || ''}`;
+    this.serverId = isLocal ? '__local__' : `remote_${config.host || config.socketPath || 'ssh'}_${config.sshPort || ''}`;
     this.name = config.name;
     this.isLocal = isLocal;
 
-    if (config.socketPath) {
+    if (config.protocol === 'ssh' && config.host) {
+      // 实时解析 SSH config，不依赖保存的路径
+      const sshInfo = resolveSshConfig(config.host);
+      const username = config.username || sshInfo.user || 'root';
+      const keyFile = config.privateKey || sshInfo.identityFile;
+
+      const sshOpts: any = {
+        protocol: 'ssh',
+        host: config.host,
+        port: config.sshPort || 22,
+        username,
+      };
+      if (keyFile) {
+        sshOpts.sshOptions = { privateKey: require('fs').readFileSync(keyFile) };
+      } else if (config.password) {
+        sshOpts.sshOptions = { password: config.password };
+      }
+      this.docker = new Docker(sshOpts);
+    } else if (config.socketPath) {
       this.docker = new Docker({ socketPath: config.socketPath });
-    } else if (config.host) {
-      this.docker = new Docker({ host: config.host, port: config.port || 2375 });
     } else {
       const isWindows = process.platform === 'win32';
       this.docker = new Docker({
@@ -165,6 +186,63 @@ class DockerServerConnection {
 
     return { compose, native: nativeContainers };
   }
+}
+
+// ---- SSH Config 解析（供连接时实时读取） ----
+
+interface SshConfigEntry {
+  hostname?: string;
+  user?: string;
+  port?: number;
+  identityFile?: string;
+}
+
+function resolveSshConfig(hostAlias: string): SshConfigEntry {
+  const os = require('os');
+  const fs = require('fs');
+  const path = require('path');
+  const configPath = path.join(os.homedir(), '.ssh', 'config');
+  if (!fs.existsSync(configPath)) { return {}; }
+
+  const content = fs.readFileSync(configPath, 'utf8');
+  const lines = content.split('\n');
+  let currentHost: string | null = null;
+  const hosts = new Map<string, SshConfigEntry>();
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) { continue; }
+    const parts = line.split(/\s+/);
+    const keyword = parts[0].toLowerCase();
+    const value = parts.slice(1).join(' ');
+
+    if (keyword === 'host') {
+      for (const h of value.split(/\s+/)) { if (h) { currentHost = h; } }
+      if (currentHost && !hosts.has(currentHost)) { hosts.set(currentHost, {}); }
+    } else if (currentHost) {
+      const entry = hosts.get(currentHost)!;
+      switch (keyword) {
+        case 'hostname': entry.hostname = value; break;
+        case 'user': entry.user = value; break;
+        case 'port': entry.port = parseInt(value, 10); break;
+        case 'identityfile':
+          entry.identityFile = value.replace(/"/g, '').replace(/^~/, os.homedir());
+          break;
+      }
+    }
+  }
+
+  // 合并所有匹配的 Host
+  const merged: SshConfigEntry = {};
+  for (const [pattern, entry] of hosts) {
+    if (pattern.includes('*') || pattern.includes('?')) {
+      const regex = new RegExp('^' + pattern.replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i');
+      if (regex.test(hostAlias)) { Object.assign(merged, entry); }
+    } else if (pattern === hostAlias) {
+      Object.assign(merged, entry);
+    }
+  }
+  return merged;
 }
 
 // ---- 树数据提供器 ----
